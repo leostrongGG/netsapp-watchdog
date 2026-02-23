@@ -15,18 +15,18 @@ Monitora o backend a cada 15 minutos e, em caso de falha, executa recuperação 
 
 ## ✨ Funcionalidades
 
-✅ Monitoramento automático via cron (a cada 15 minutos)
-✅ **Auto-detecção de `sudo`** — funciona tanto como `root` quanto como `ubuntu` ou outro user
-✅ **Cooldown de 15 minutos** — evita loops de recuperação que travam a VPS
-✅ **4 níveis de recuperação escalonada** — update só como último recurso
-✅ Sistema de lock (previne execuções simultâneas)
-✅ Proteção contra falsos positivos (detecta updates/deploys em andamento)
-✅ Rotação automática de log (`watchdog.log` máx. 1MB)
-✅ Limpeza de crash logs antigos (mantém últimos 10)
-✅ Identificação da VPS no webhook (`VPS_NAME` + `BACKEND_PUBLIC_URL`)
-✅ Backup automático de logs do backend (FULL ou TAIL configurável)
-✅ Notificação via webhook (n8n, Make, Zapier, etc)
-✅ Payload JSON estruturado
+- ✅ Monitoramento automático via cron (a cada 15 minutos)
+- ✅ **Auto-detecção de `sudo`** — funciona tanto como `root` quanto como `ubuntu` ou outro user
+- ✅ **Cooldown de 15 minutos** — evita loops de recuperação que travam a VPS
+- ✅ **4 níveis de recuperação escalonada** — update só como último recurso
+- ✅ Sistema de lock (previne execuções simultâneas)
+- ✅ Proteção contra falsos positivos (detecta updates/deploys em andamento)
+- ✅ Rotação automática de log (`watchdog.log` máx. 1MB)
+- ✅ Limpeza de crash logs antigos (mantém últimos 10)
+- ✅ Identificação da VPS no webhook (`VPS_NAME` + `BACKEND_PUBLIC_URL`)
+- ✅ Backup automático de logs do backend (FULL ou TAIL configurável)
+- ✅ Notificação via webhook (n8n, Make, Zapier, etc)
+- ✅ Payload JSON estruturado
 
 ## 📊 Antes vs Depois
 
