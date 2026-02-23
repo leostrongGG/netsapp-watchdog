@@ -123,6 +123,7 @@ crontab -e
 
 Adicione a linha abaixo no final do arquivo:
 ```
+# Watchdog Netsapp - verificação a cada 15 minutos
 */15 * * * * /home/ubuntu/watchdog/netsapp-watchdog.sh >> /dev/null 2>&1
 ```
 
