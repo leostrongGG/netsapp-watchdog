@@ -1,46 +1,77 @@
 #!/bin/bash
 
-# ===== CONFIGURAÇÕES PRINCIPAIS =====
-COMPOSE_DIR="/home/ubuntu/ticketz-docker-acme"
-LOG_DIR="/home/ubuntu/watchdog/logs"
-BACKEND_CONTAINER="ticketz-docker-acme-backend-1"
-BACKEND_URL="http://ticketz-docker-acme-backend-1:3000/"
-RETRIES=3
-RETRY_DELAY=10  # segundos entre tentativas
+# ===== CARREGAR CONFIGURAÇÕES EXTERNAS =====
+# O arquivo .env-watchdog deve estar no mesmo diretório do script.
+# Copie .env-watchdog-example para .env-watchdog e edite seus valores.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/.env-watchdog"
 
-# ===== CONFIGURAÇÕES DE BACKUP DE LOGS =====
-# Controla se e como os logs do backend serão salvos antes da recuperação
-SAVE_BACKEND_LOGS=true           # true = salva logs | false = não salva
+if [ ! -f "$ENV_FILE" ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ ERRO: Arquivo de configuração não encontrado: $ENV_FILE" >&2
+    echo "  Copie o exemplo e edite:  cp $SCRIPT_DIR/.env-watchdog-example $ENV_FILE" >&2
+    exit 1
+fi
 
-# Tipo de backup (usado apenas se SAVE_BACKEND_LOGS=true)
-BACKUP_TYPE="FULL"               # FULL = log completo | TAIL = últimas N linhas
+# shellcheck disable=SC1090
+source "$ENV_FILE"
 
-# Quantidade de linhas (usado apenas se BACKUP_TYPE="TAIL")
-BACKUP_TAIL_LINES=5000           # Número de linhas finais a salvar (ex: 5000, 10000)
+# Validar variáveis obrigatórias
+for var in TICKETZ_DIR BACKEND_CONTAINER; do
+    if [ -z "${!var}" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ ERRO: Variável obrigatória '$var' não definida em $ENV_FILE" >&2
+        exit 1
+    fi
+done
 
-# ===== CONFIGURAÇÕES DE NOTIFICAÇÃO VIA WEBHOOK =====
-WEBHOOK_URL="https://seu-n8n.com/webhook/watchdog"
-                # ← URL do webhook (n8n, Make, Zapier, etc)
-                # Deixe vazio para desabilitar notificações
+# LOG_DIR é sempre na pasta logs/ junto ao script (não configurável)
+LOG_DIR="$SCRIPT_DIR/logs"
 
-WEBHOOK_AUTH_HEADER="Bearer SEU_TOKEN_AQUI"
-                # ← Token de autenticação do webhook
-                # Formato: Bearer seu_token_aqui
-                # Deixe vazio ("") se não usar autenticação
+# Defaults para variáveis opcionais (caso não definidas no .env-watchdog)
+VPS_NAME="${VPS_NAME:-$(hostname)}"
+BACKEND_PUBLIC_URL="${BACKEND_PUBLIC_URL:-}"
+BACKEND_PORT="${BACKEND_PORT:-3000}"
+BACKEND_URL="http://${BACKEND_CONTAINER}:${BACKEND_PORT}/"
+FRONTEND_CONTAINER="${BACKEND_CONTAINER/backend/frontend}"
+RETRIES="${RETRIES:-3}"
+RETRY_DELAY="${RETRY_DELAY:-10}"
+SAVE_BACKEND_LOGS="${SAVE_BACKEND_LOGS:-true}"
+BACKUP_TYPE="${BACKUP_TYPE:-TAIL}"
+BACKUP_TAIL_LINES="${BACKUP_TAIL_LINES:-10000}"
+WEBHOOK_URL="${WEBHOOK_URL:-}"
+WEBHOOK_AUTH_HEADER="${WEBHOOK_AUTH_HEADER:-}"
+LOCK_FILE="${LOCK_FILE:-/tmp/netsapp-watchdog.lock}"
+LOCK_TIMEOUT="${LOCK_TIMEOUT:-600}"
+UPDATE_DETECTION_WAIT="${UPDATE_DETECTION_WAIT:-30}"
+COOLDOWN_FILE="${COOLDOWN_FILE:-/tmp/netsapp-watchdog-cooldown}"
+COOLDOWN_SECONDS="${COOLDOWN_SECONDS:-900}"
 
-# ===== SISTEMA DE LOCK =====
-LOCK_FILE="/tmp/netsapp-watchdog.lock"
-LOCK_TIMEOUT=1200                # 20 minutos (tempo máximo que o script pode rodar)
+# =====
 
-# ===== PROTEÇÃO CONTRA CONFLITOS DE UPDATE =====
-UPDATE_DETECTION_WAIT=30         # Segundos para aguardar e confirmar se é update ou crash
-
-# ===== NÃO ALTERAR DAQUI PARA BAIXO =====
+# --- Auto-detecção de sudo para Docker ---
+# Se o usuário atual NÃO consegue acessar o Docker sem sudo, usa "sudo".
+# Detecta automaticamente: funciona tanto como root quanto como ubuntu/outro user.
+SUDO=""
+if ! docker info > /dev/null 2>&1; then
+    if sudo docker info > /dev/null 2>&1; then
+        SUDO="sudo"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ❌ ERRO: Sem acesso ao Docker (nem com sudo). Abortando." >&2
+        exit 1
+    fi
+fi
 
 # Criar diretório de logs se não existir
 mkdir -p "$LOG_DIR"
 
 WATCHDOG_LOG="$LOG_DIR/watchdog.log"
+
+# Rotação simples do log (máximo 1MB)
+if [ -f "$WATCHDOG_LOG" ]; then
+    log_size=$(stat -c %s "$WATCHDOG_LOG" 2>/dev/null || echo 0)
+    if [ "$log_size" -gt 1048576 ]; then
+        mv "$WATCHDOG_LOG" "$WATCHDOG_LOG.old"
+    fi
+fi
 
 # Variável global para armazenar path do crash log
 CRASH_LOG_PATH=""
@@ -50,13 +81,32 @@ log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$WATCHDOG_LOG"
 }
 
+# Função para verificar cooldown
+check_cooldown() {
+    if [ -f "$COOLDOWN_FILE" ]; then
+        local cooldown_age=$(($(date +%s) - $(stat -c %Y "$COOLDOWN_FILE" 2>/dev/null || echo 0)))
+        if [ $cooldown_age -lt $COOLDOWN_SECONDS ]; then
+            local remaining=$((COOLDOWN_SECONDS - cooldown_age))
+            log_message "⏸️ Em cooldown (${remaining}s restantes), pulando ação de recuperação"
+            return 0  # Em cooldown
+        else
+            rm -f "$COOLDOWN_FILE"
+        fi
+    fi
+    return 1  # Sem cooldown
+}
+
+# Função para ativar cooldown
+set_cooldown() {
+    touch "$COOLDOWN_FILE"
+    log_message "⏸️ Cooldown ativado por ${COOLDOWN_SECONDS}s"
+}
+
 # Função para adquirir lock (evitar múltiplas execuções)
 acquire_lock() {
-    # Verificar se já existe um lock
     if [ -f "$LOCK_FILE" ]; then
         local lock_age=$(($(date +%s) - $(stat -c %Y "$LOCK_FILE" 2>/dev/null || echo 0)))
-        
-        # Se lock tem mais de LOCK_TIMEOUT, é stale (travou), remover
+
         if [ $lock_age -gt $LOCK_TIMEOUT ]; then
             log_message "⚠️ Lock antigo detectado (${lock_age}s > ${LOCK_TIMEOUT}s), removendo..."
             rm -f "$LOCK_FILE"
@@ -65,17 +115,14 @@ acquire_lock() {
             exit 0
         fi
     fi
-    
-    # Criar lock com PID atual
+
     echo $$ > "$LOCK_FILE"
-    log_message "🔒 Lock adquirido (PID: $$, timeout: ${LOCK_TIMEOUT}s)"
 }
 
 # Função para liberar lock
 release_lock() {
     if [ -f "$LOCK_FILE" ]; then
         rm -f "$LOCK_FILE"
-        log_message "🔓 Lock liberado"
     fi
 }
 
@@ -87,44 +134,41 @@ detect_update_in_progress() {
     # Verificar se script update.ticke.tz está rodando
     if pgrep -f "update.ticke.tz" > /dev/null; then
         log_message "⏸️ Update manual (update.ticke.tz) em andamento, aguardando próxima verificação..."
-        return 0  # 0 = true (update detectado)
+        return 0
     fi
-    
+
     # Verificar se há processo docker compose pull rodando (indica update)
     if pgrep -f "docker.*compose.*pull" > /dev/null; then
         log_message "⏸️ Docker compose pull em andamento, aguardando próxima verificação..."
         return 0
     fi
-    
-    # Verificar se Watchtower está rodando E backend está ausente
-    if pgrep -f "watchtower" > /dev/null; then
-        if ! sudo docker ps --format '{{.Names}}' | grep -q "ticketz-docker-acme-backend-1"; then
-            log_message "⏸️ Watchtower detectado e backend ausente (provável update), aguardando..."
-            return 0
-        fi
+
+    # Verificar se docker compose up está rodando (pode ser deploy manual)
+    if pgrep -f "docker.*compose.*up" > /dev/null; then
+        log_message "⏸️ Docker compose up em andamento, aguardando próxima verificação..."
+        return 0
     fi
-    
-    return 1  # 1 = false (nenhum update detectado)
+
+    return 1
 }
 
 # Função para verificar se backend está ausente (pode ser update ou crash)
 check_backend_exists() {
-    if ! sudo docker ps --format '{{.Names}}' | grep -q "ticketz-docker-acme-backend-1"; then
+    if ! $SUDO docker ps --format '{{.Names}}' | grep -q "$BACKEND_CONTAINER"; then
         log_message "⚠️ Backend não encontrado na lista de containers rodando"
         log_message "🕐 Aguardando ${UPDATE_DETECTION_WAIT}s para confirmar se é update ou crash real..."
         sleep $UPDATE_DETECTION_WAIT
-        
-        # Verificar novamente após aguardar
-        if ! sudo docker ps --format '{{.Names}}' | grep -q "ticketz-docker-acme-backend-1"; then
+
+        if ! $SUDO docker ps --format '{{.Names}}' | grep -q "$BACKEND_CONTAINER"; then
             log_message "🚨 Backend continua ausente após ${UPDATE_DETECTION_WAIT}s - confirmado como crash"
-            return 1  # Backend realmente ausente (crash)
+            return 1
         else
             log_message "✅ Backend voltou durante espera - era processo de atualização"
-            return 0  # Backend voltou (era update)
+            return 0
         fi
     fi
-    
-    return 0  # Backend existe
+
+    return 0
 }
 
 # Função para verificar saúde do backend
@@ -132,11 +176,9 @@ check_backend() {
     local attempt=1
 
     while [ $attempt -le $RETRIES ]; do
-        # Executa curl DENTRO da rede Docker via container frontend
-        HTTP_CODE=$(sudo docker exec ticketz-docker-acme-frontend-1 curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$BACKEND_URL" 2>/dev/null)
+        HTTP_CODE=$($SUDO docker exec "$FRONTEND_CONTAINER" curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$BACKEND_URL" 2>/dev/null)
 
         if [ "$HTTP_CODE" = "200" ]; then
-            log_message "✅ Backend OK (HTTP $HTTP_CODE) - tentativa $attempt"
             return 0
         fi
 
@@ -148,50 +190,39 @@ check_backend() {
         fi
     done
 
-    return 1  # Falhou após todas as tentativas
+    return 1
 }
 
 # Função para salvar log do backend (com opções configuráveis)
 save_backend_logs() {
-    # Verificar se backup está habilitado
     if [ "$SAVE_BACKEND_LOGS" != "true" ]; then
-        log_message "⏭️ Backup de logs desabilitado (SAVE_BACKEND_LOGS=false), pulando..."
         CRASH_LOG_PATH="(não salvo)"
         return 0
     fi
-    
+
     local timestamp=$(date '+%Y%m%d_%H%M%S')
     CRASH_LOG_PATH="$LOG_DIR/backend-crash_${timestamp}.log"
 
-    cd "$COMPOSE_DIR"
+    cd "$TICKETZ_DIR"
 
     if [ "$BACKUP_TYPE" = "FULL" ]; then
-        log_message "📝 Salvando LOG COMPLETO do backend (pode demorar ~10-30s)..."
-        log_message "📂 Arquivo: $CRASH_LOG_PATH"
-        
-        # Salvar LOG COMPLETO (sem --tail)
-        sudo docker compose logs -t backend > "$CRASH_LOG_PATH" 2>&1
-        
-    elif [ "$BACKUP_TYPE" = "TAIL" ]; then
-        log_message "📝 Salvando ÚLTIMAS ${BACKUP_TAIL_LINES} LINHAS do backend (~2-5s)..."
-        log_message "📂 Arquivo: $CRASH_LOG_PATH"
-        
-        # Salvar apenas últimas N linhas
-        sudo docker compose logs -t --tail ${BACKUP_TAIL_LINES} backend > "$CRASH_LOG_PATH" 2>&1
+        log_message "📝 Salvando LOG COMPLETO do backend..."
+        $SUDO docker compose logs -t backend > "$CRASH_LOG_PATH" 2>&1
     else
-        log_message "⚠️ BACKUP_TYPE inválido ('$BACKUP_TYPE'), usando TAIL com 5000 linhas..."
-        BACKUP_TAIL_LINES=5000
-        sudo docker compose logs -t --tail ${BACKUP_TAIL_LINES} backend > "$CRASH_LOG_PATH" 2>&1
+        log_message "📝 Salvando ÚLTIMAS ${BACKUP_TAIL_LINES} LINHAS do backend..."
+        $SUDO docker compose logs -t --tail ${BACKUP_TAIL_LINES} backend > "$CRASH_LOG_PATH" 2>&1
     fi
 
     if [ -f "$CRASH_LOG_PATH" ]; then
         local filesize=$(du -h "$CRASH_LOG_PATH" | cut -f1)
         local linecount=$(wc -l < "$CRASH_LOG_PATH")
-        log_message "✅ Log salvo com sucesso: $filesize, ${linecount} linhas"
+        log_message "✅ Log salvo: $filesize, ${linecount} linhas → $CRASH_LOG_PATH"
     else
-        log_message "❌ ERRO ao salvar log!"
         CRASH_LOG_PATH="(erro ao salvar)"
     fi
+
+    # Limpar crash logs antigos (manter apenas últimos 10)
+    ls -t "$LOG_DIR"/backend-crash_*.log 2>/dev/null | tail -n +11 | xargs rm -f 2>/dev/null
 }
 
 # Função para enviar notificação via Webhook
@@ -200,37 +231,29 @@ send_webhook_notification() {
     local status="$2"
     local message="$3"
     local recovery_duration="${4:-}"
-    
-    # Verificar se webhook está configurado
+
     if [ -z "$WEBHOOK_URL" ]; then
-        log_message "⏭️ Webhook não configurado, pulando notificação..."
         return 0
     fi
-    
-    log_message "📡 Enviando notificação via webhook..."
-    
-    # Preparar dados
+
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local hostname=$(hostname)
     local crash_log_filename="${CRASH_LOG_PATH##*/}"
-    local crash_log_size=""
-    local crash_log_lines=""
-    
-    # Obter tamanho e linhas do log (se existir)
+    local crash_log_size="N/A"
+    local crash_log_lines="N/A"
+
     if [ -f "$CRASH_LOG_PATH" ] && [ "$CRASH_LOG_PATH" != "(não salvo)" ] && [ "$CRASH_LOG_PATH" != "(erro ao salvar)" ]; then
         crash_log_size=$(du -h "$CRASH_LOG_PATH" 2>/dev/null | cut -f1)
         crash_log_lines=$(wc -l < "$CRASH_LOG_PATH" 2>/dev/null)
-    else
-        crash_log_size="N/A"
-        crash_log_lines="N/A"
     fi
-    
-    # Construir payload JSON
-    local payload=$(cat <<EOF
+
+    local payload=$(cat <<EOFPAYLOAD
 {
   "event": "watchdog_alert",
   "timestamp": "$timestamp",
+  "vps_name": "$VPS_NAME",
   "hostname": "$hostname",
+  "backend_url": "$BACKEND_PUBLIC_URL",
   "level": $level,
   "status": "$status",
   "message": "$message",
@@ -242,74 +265,63 @@ send_webhook_notification() {
     "recovery_duration": "$recovery_duration"
   }
 }
-EOF
+EOFPAYLOAD
 )
-    
-    # Enviar webhook
+
+    local response
     if [ -z "$WEBHOOK_AUTH_HEADER" ]; then
-        # Sem autenticação
-        local response=$(curl -s -w "\n%{http_code}" -X POST "$WEBHOOK_URL" \
+        response=$(curl -s -w "\n%{http_code}" -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
+            --max-time 15 \
             -d "$payload" 2>&1)
     else
-        # Com autenticação
-        local response=$(curl -s -w "\n%{http_code}" -X POST "$WEBHOOK_URL" \
+        response=$(curl -s -w "\n%{http_code}" -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -H "Authorization: $WEBHOOK_AUTH_HEADER" \
+            --max-time 15 \
             -d "$payload" 2>&1)
     fi
-    
+
     local http_code=$(echo "$response" | tail -n1)
-    local response_body=$(echo "$response" | head -n -1)
-    
+
     if [ "$http_code" = "200" ] || [ "$http_code" = "201" ] || [ "$http_code" = "204" ]; then
-        log_message "✅ Webhook enviado com sucesso (HTTP $http_code)"
-        log_message "📡 Resposta: $response_body"
-        return 0
+        log_message "✅ Webhook enviado (HTTP $http_code)"
     else
         log_message "❌ Erro ao enviar webhook (HTTP $http_code)"
-        log_message "📡 Resposta: $response_body"
-        return 1
     fi
 }
 
-# NÍVEL 1: Reinício rápido (down + up)
+# NÍVEL 1: Reinício rápido (apenas backend e frontend)
 level1_quick_restart() {
-    log_message "🔧 NÍVEL 1: Tentando reinício rápido (down + up)"
+    log_message "🔧 NÍVEL 1: Reinício rápido do backend e frontend"
 
     local start_time=$(date +%s)
 
-    cd "$COMPOSE_DIR"
+    cd "$TICKETZ_DIR"
 
-    # Derrubar containers completamente
-    log_message "🔽 Derrubando frontend..."
-    sudo docker compose down frontend
+    # Derrubar apenas backend e frontend
+    log_message "🔽 Derrubando backend e frontend..."
+    $SUDO docker compose stop backend frontend 2>&1 | tail -2 >> "$WATCHDOG_LOG"
+    $SUDO docker compose rm -f backend frontend 2>&1 | tail -2 >> "$WATCHDOG_LOG"
 
-    log_message "🔽 Derrubando backend..."
-    sudo docker compose down backend
+    sleep 5
 
-    log_message "⏳ Aguardando 10 segundos..."
-    sleep 10
-
-    # Recriar containers do zero com -d (detached mode)
+    # Recriar containers
     log_message "🔼 Recriando backend e frontend..."
-    sudo docker compose up -d backend frontend
+    $SUDO docker compose up -d backend frontend 2>&1 | tail -5 >> "$WATCHDOG_LOG"
 
-    # Aguardar containers iniciarem (up -d demora ~10-20s) + margem
-    log_message "⏳ Aguardando 40 segundos para estabilização completa..."
-    sleep 40
+    # Aguardar estabilização
+    log_message "⏳ Aguardando 45 segundos para estabilização..."
+    sleep 45
 
-    # Verificar se recuperou (3 tentativas com 10s cada)
-    log_message "🔍 Verificando recuperação..."
+    # Verificar recuperação
     if check_backend; then
         local end_time=$(date +%s)
         local duration=$((end_time - start_time))
-        
-        log_message "✅ NÍVEL 1: RECUPERAÇÃO BEM-SUCEDIDA!"
-        
-        # Enviar notificação de recuperação
-        send_webhook_notification 1 "success" "Sistema recuperado automaticamente via Nível 1 (Reinício Rápido)" "${duration}s"
-        
+
+        log_message "✅ NÍVEL 1: RECUPERAÇÃO BEM-SUCEDIDA! (${duration}s)"
+        send_webhook_notification 1 "success" "Sistema recuperado via Nível 1 (Reinício Rápido)" "${duration}s"
+        set_cooldown
         return 0
     else
         log_message "❌ NÍVEL 1: FALHOU - Escalando para Nível 2"
@@ -317,19 +329,65 @@ level1_quick_restart() {
     fi
 }
 
-# NÍVEL 2: Atualização completa do sistema
-level2_full_update() {
-    log_message "🔧 NÍVEL 2: Executando atualização completa do sistema"
-    log_message "⚠️ ATENÇÃO: Este processo pode demorar 2-5 minutos (pull de imagens)"
+# NÍVEL 2: Reinício completo de toda a stack (sem update)
+level2_full_restart() {
+    log_message "🔧 NÍVEL 2: Reinício completo de toda a stack Docker"
 
-    # Executar script de atualização oficial
+    local start_time=$(date +%s)
+
+    cd "$TICKETZ_DIR"
+
+    # Derrubar TODA a stack
+    log_message "🔽 Derrubando todos os containers..."
+    $SUDO docker compose down 2>&1 | tail -10 >> "$WATCHDOG_LOG"
+
+    sleep 10
+
+    # Subir toda a stack
+    log_message "🔼 Recriando toda a stack..."
+    $SUDO docker compose up -d 2>&1 | tail -10 >> "$WATCHDOG_LOG"
+
+    # Aguardar estabilização (mais tempo para toda a stack)
+    log_message "⏳ Aguardando 90 segundos para estabilização completa..."
+    sleep 90
+
+    # Verificar recuperação com mais tentativas
+    local max_attempts=3
+    local attempt=1
+
+    while [ $attempt -le $max_attempts ]; do
+        if check_backend; then
+            local total_duration=$(($(date +%s) - start_time))
+            log_message "✅ NÍVEL 2: RECUPERAÇÃO BEM-SUCEDIDA! (${total_duration}s)"
+            send_webhook_notification 2 "success" "Sistema recuperado via Nível 2 (Reinício Completo)" "${total_duration}s"
+            set_cooldown
+            return 0
+        fi
+
+        if [ $attempt -lt $max_attempts ]; then
+            log_message "⏳ Backend ainda não respondeu, aguardando mais 30s (tentativa $attempt/$max_attempts)..."
+            sleep 30
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    log_message "❌ NÍVEL 2: FALHOU - Sistema não recuperou após reinício completo"
+    return 1
+}
+
+# NÍVEL 3: Update do sistema (último recurso antes de falha crítica)
+level3_update_restart() {
+    log_message "🔧 NÍVEL 3: Atualização do sistema (último recurso)"
     log_message "📥 Baixando e executando update.ticke.tz..."
-    
-    local update_start=$(date +%s)
-    
-    # O script faz: pull (1-5min) + down (~10s) + up (~10-20s) + prune
-    if curl -sSL update.ticke.tz | sudo bash >> "$WATCHDOG_LOG" 2>&1; then
-        local update_duration=$(($(date +%s) - update_start))
+
+    local start_time=$(date +%s)
+
+    cd "$TICKETZ_DIR"
+
+    # O script update faz: pull + down + up + prune
+    if curl -sSL update.ticke.tz | $SUDO bash >> "$WATCHDOG_LOG" 2>&1; then
+        local update_duration=$(($(date +%s) - start_time))
         log_message "✅ Script de atualização executado com sucesso (${update_duration}s)"
     else
         local exit_code=$?
@@ -337,135 +395,136 @@ level2_full_update() {
         return 1
     fi
 
-    # Após update, containers já estão UP mas podem estar inicializando
-    log_message "⏳ Aguardando 120 segundos para sistema completo inicializar..."
-    sleep 120
+    # Aguardar estabilização pós-update
+    log_message "⏳ Aguardando 90 segundos para sistema inicializar..."
+    sleep 90
 
-    # Verificar se recuperou com tentativas progressivas
-    log_message "🔍 Verificando recuperação pós-update (5 tentativas)..."
-    
-    local max_attempts=5
+    # Verificar recuperação
+    local max_attempts=3
     local attempt=1
-    
+
     while [ $attempt -le $max_attempts ]; do
-        log_message "🔍 Tentativa $attempt/$max_attempts..."
-        
         if check_backend; then
-            local total_duration=$(($(date +%s) - update_start))
-            
-            log_message "✅ NÍVEL 2: ATUALIZAÇÃO E RECUPERAÇÃO BEM-SUCEDIDA!"
-            
-            # Enviar notificação de recuperação
-            send_webhook_notification 2 "success" "Sistema recuperado após atualização completa (Update Completo)" "${total_duration}s"
-            
+            local total_duration=$(($(date +%s) - start_time))
+            log_message "✅ NÍVEL 3: ATUALIZAÇÃO E RECUPERAÇÃO BEM-SUCEDIDA! (${total_duration}s)"
+            send_webhook_notification 3 "success" "Sistema recuperado via Nível 3 (Update do Sistema)" "${total_duration}s"
+            set_cooldown
             return 0
         fi
-        
+
         if [ $attempt -lt $max_attempts ]; then
-            log_message "⏳ Backend ainda não respondeu, aguardando mais 30s..."
+            log_message "⏳ Backend ainda não respondeu, aguardando mais 30s (tentativa $attempt/$max_attempts)..."
             sleep 30
         fi
-        
+
         attempt=$((attempt + 1))
     done
-    
-    log_message "❌ NÍVEL 2: FALHOU - Sistema não recuperou após update"
+
+    log_message "❌ NÍVEL 3: FALHOU - Sistema não recuperou mesmo após update"
     return 1
 }
 
-# NÍVEL 3: Falha crítica - registrar e alertar
-level3_critical_failure() {
+# NÍVEL 4: Falha crítica - registrar e alertar
+level4_critical_failure() {
     local timestamp=$(date '+%Y%m%d_%H%M%S')
     local critical_log="$LOG_DIR/CRITICAL-FAILURE_${timestamp}.log"
 
-    log_message "🚨🚨🚨 NÍVEL 3: FALHA CRÍTICA - INTERVENÇÃO MANUAL NECESSÁRIA"
+    log_message "🚨🚨🚨 NÍVEL 4: FALHA CRÍTICA - INTERVENÇÃO MANUAL NECESSÁRIA"
 
-    # Coletar informações de diagnóstico
     {
         echo "========================================="
         echo "FALHA CRÍTICA DO SISTEMA NETSAPP"
         echo "Data/Hora: $(date '+%Y-%m-%d %H:%M:%S')"
-        echo "Log completo do crash salvo em: $CRASH_LOG_PATH"
+        echo "VPS: $VPS_NAME"
+        echo "Log do crash: $CRASH_LOG_PATH"
         echo "========================================="
         echo ""
         echo "--- STATUS DOS CONTAINERS ---"
-        sudo docker ps -a
+        $SUDO docker ps -a
         echo ""
         echo "--- LOGS DO BACKEND (últimas 100 linhas) ---"
-        cd "$COMPOSE_DIR"
-        sudo docker compose logs --tail 100 backend 2>&1
+        cd "$TICKETZ_DIR"
+        $SUDO docker compose logs --tail 100 backend 2>&1
         echo ""
         echo "--- LOGS DO FRONTEND (últimas 50 linhas) ---"
-        sudo docker compose logs --tail 50 frontend 2>&1
+        $SUDO docker compose logs --tail 50 frontend 2>&1
         echo ""
-        echo "--- USO DE RECURSOS ---"
+        echo "--- USO DE DISCO ---"
         df -h
         echo ""
+        echo "--- USO DE MEMÓRIA ---"
         free -h
         echo ""
         echo "--- PROCESSOS DOCKER ---"
-        sudo docker stats --no-stream
+        $SUDO docker stats --no-stream 2>&1
     } > "$critical_log" 2>&1
 
-    log_message "📝 Relatório de falha crítica salvo em: $critical_log"
-    log_message "📝 Log completo do backend em: $CRASH_LOG_PATH"
+    log_message "📝 Relatório de falha crítica: $critical_log"
 
-    # Enviar notificação URGENTE via Webhook
-    local critical_message="FALHA CRÍTICA! Todos os níveis de recuperação falharam (Nível 1: Reinício Rápido, Nível 2: Update Completo). Intervenção manual necessária. Diagnóstico completo salvo em: ${critical_log##*/}"
-    
-    send_webhook_notification 3 "critical" "$critical_message" "N/A"
+    send_webhook_notification 4 "critical" \
+        "FALHA CRÍTICA! Nível 1 (Reinício Rápido), Nível 2 (Reinício Completo) e Nível 3 (Update) falharam. Intervenção manual necessária. Diagnóstico: ${critical_log##*/}" \
+        "N/A"
+
+    set_cooldown
 
     return 1
 }
 
-# ===== EXECUÇÃO PRINCIPAL COM ESCALONAMENTO =====
+# ===== EXECUÇÃO PRINCIPAL =====
 
-# Adquirir lock antes de tudo (impede execuções simultâneas)
 acquire_lock
 
-log_message "🔍 Iniciando verificação do Netsapp"
+log_message "🔍 Verificação iniciada"
 
-# PROTEÇÃO: Detectar se há update em andamento
+# Verificar se há update em andamento
 if detect_update_in_progress; then
-    exit 0  # Sai sem fazer nada, aguarda próxima verificação
-fi
-
-# PROTEÇÃO: Verificar se backend existe (pode estar sendo atualizado)
-if ! check_backend_exists; then
-    log_message "🚨 Backend ausente confirmado como crash (não é update)"
-    # Continua para recuperação
-else
-    log_message "✅ Backend existe, prosseguindo com verificação de saúde"
-fi
-
-if check_backend; then
-    log_message "✅ Sistema operacional - nenhuma ação necessária"
     exit 0
-else
-    log_message "🚨 Sistema com problemas detectado!"
-
-    # ===== SALVAR LOG DO BACKEND (SE HABILITADO) =====
-    save_backend_logs
-    # ================================================
-
-    log_message "🔄 Iniciando procedimento de recuperação escalonada..."
-
-    # Tentar Nível 1: Reinício rápido
-    if level1_quick_restart; then
-        exit 0
-    fi
-
-    log_message "⚠️ Nível 1 falhou - aguardando 20s antes do Nível 2..."
-    sleep 20
-
-    # Tentar Nível 2: Atualização completa
-    if level2_full_update; then
-        exit 0
-    fi
-
-    log_message "⚠️ Nível 2 falhou - registrando falha crítica..."
-
-    # Nível 3: Falha crítica
-    level3_critical_failure
-    exit 1
 fi
+
+# Verificar se backend existe
+if ! check_backend_exists; then
+    log_message "🚨 Backend ausente confirmado como crash"
+fi
+
+# Verificar saúde do backend
+if check_backend; then
+    log_message "✅ Sistema OK"
+    exit 0
+fi
+
+# === SISTEMA COM PROBLEMAS ===
+log_message "🚨 Sistema com problemas detectado!"
+
+# Verificar cooldown antes de agir
+if check_cooldown; then
+    log_message "⏸️ Recuperação já foi tentada recentemente, aguardando expirar cooldown"
+    exit 0
+fi
+
+# Salvar log do backend antes de qualquer ação
+save_backend_logs
+
+log_message "🔄 Iniciando recuperação escalonada..."
+
+# Nível 1: Reinício rápido (apenas backend + frontend)
+if level1_quick_restart; then
+    exit 0
+fi
+
+sleep 10
+
+# Nível 2: Reinício completo da stack
+if level2_full_restart; then
+    exit 0
+fi
+
+sleep 10
+
+# Nível 3: Update do sistema (último recurso)
+if level3_update_restart; then
+    exit 0
+fi
+
+# Nível 4: Falha crítica
+level4_critical_failure
+exit 1

@@ -1,36 +1,42 @@
 ﻿# 🛡️ Netsapp Watchdog - Monitoramento e Recuperação Automática
 
-Script shell para monitoramento e recuperação automática de sistemas Ticketz rodando em Docker.
+Script shell profissional para monitoramento e recuperação automática de sistemas Ticketz rodando em Docker.
 
 ## 🎯 O que faz?
 
-Monitora o backend a cada 1 minuto e, em caso de falha, executa recuperação automática em 3 níveis:
+Monitora o backend a cada 15 minutos e, em caso de falha, executa recuperação automática em 4 níveis:
 
-- **Nível 1** (Reinício Rápido): `docker compose down/up` → ~2 minutos
-- **Nível 2** (Update Completo): Executa `curl update.ticke.tz` → ~5-8 minutos  
-- **Nível 3** (Falha Crítica): Gera diagnóstico completo e alerta
+- **Nível 1** (Reinício Rápido): Reinicia backend + frontend → ~1 minuto
+- **Nível 2** (Reinício Completo): `docker compose down/up` de toda a stack → ~2 minutos
+- **Nível 3** (Update): Executa `curl update.ticke.tz` → ~5-8 minutos (último recurso)
+- **Nível 4** (Falha Crítica): Gera diagnóstico completo e alerta via webhook
 
-**Taxa de sucesso:** ~99% (90% Nível 1, 9% Nível 2, 1% requer intervenção)
+**Taxa de sucesso:** ~99% (85% Nível 1, 10% Nível 2, 4% Nível 3, 1% requer intervenção)
 
 ## ✨ Funcionalidades
 
-✅ Monitoramento automático via cron (1 em 1 minuto)  
-✅ Sistema de lock (previne execuções simultâneas)  
-✅ Proteção contra falsos positivos (detecta updates em andamento)  
-✅ Backup automático de logs (FULL ou TAIL configurável)  
-✅ Notificação via webhook (n8n, Make, Zapier, etc)  
-✅ Payload JSON estruturado  
-✅ 3 níveis de recuperação escalonada  
-✅ Logging detalhado  
+✅ Monitoramento automático via cron (a cada 15 minutos)
+✅ **Auto-detecção de `sudo`** — funciona tanto como `root` quanto como `ubuntu` ou outro user
+✅ **Cooldown de 15 minutos** — evita loops de recuperação que travam a VPS
+✅ **4 níveis de recuperação escalonada** — update só como último recurso
+✅ Sistema de lock (previne execuções simultâneas)
+✅ Proteção contra falsos positivos (detecta updates/deploys em andamento)
+✅ Rotação automática de log (`watchdog.log` máx. 1MB)
+✅ Limpeza de crash logs antigos (mantém últimos 10)
+✅ Identificação da VPS no webhook (`VPS_NAME` + `BACKEND_PUBLIC_URL`)
+✅ Backup automático de logs do backend (FULL ou TAIL configurável)
+✅ Notificação via webhook (n8n, Make, Zapier, etc)
+✅ Payload JSON estruturado
 
 ## 📊 Antes vs Depois
 
 | Situação | Sem Watchdog | Com Watchdog |
 |---|---|---|
-| **Detecção** | Manual (horas) | Automática (1 min) |
-| **Recuperação** | Manual (minutos) | Automática (2-8 min) |
+| **Detecção** | Manual (horas) | Automática (15 min) |
+| **Recuperação** | Manual (minutos) | Automática (1-8 min) |
 | **Downtime** | 30min - 2h | 3-10 min |
 | **Notificação** | Clientes reclamam | Webhook automático |
+| **Loops** | Pode travar a VPS | Cooldown impede |
 
 ## 🚀 Instalação Rápida
 
@@ -40,45 +46,58 @@ Monitora o backend a cada 1 minuto e, em caso de falha, executa recuperação au
 - Sistema Ticketz rodando em Docker Compose
 - (Opcional) n8n, Make ou Zapier para notificações
 
-### Passo 1: Criar estrutura
+> **Nota:** O script detecta automaticamente se precisa de `sudo` para acessar o Docker.
+> Funciona sem alteração tanto em VPS com login `root` quanto com login `ubuntu`.
+
+### Passo 1: Clonar o repositório
 
 ```bash
-# Criar diretório
-mkdir -p /home/ubuntu/watchdog/logs
-cd /home/ubuntu/watchdog
-
-# Baixar script
-wget https://raw.githubusercontent.com/leostrongGG/netsapp-watchdog/main/netsapp-watchdog.sh
-
-# Dar permissão
+cd ~
+git clone https://github.com/leostrongGG/netsapp-watchdog.git watchdog
+cd watchdog
 chmod +x netsapp-watchdog.sh
+cp .env-watchdog-example .env-watchdog
 ```
 
 ### Passo 2: Configurar variáveis
 
+> **Importante:** Todas as configurações ficam no arquivo `.env-watchdog` (ignorado pelo git).
+> O script nunca precisa ser editado — você pode atualizá-lo com `git pull` a qualquer momento
+> sem perder suas configurações.
+
 ```bash
-nano netsapp-watchdog.sh
+nano .env-watchdog
 ```
 
-**Editar no topo do arquivo:**
+**Editar as variáveis principais:**
 
 ```bash
-# ===== CONFIGURAÇÕES PRINCIPAIS =====
-COMPOSE_DIR="/home/ubuntu/ticketz-docker-acme"  # ← SEU diretório Docker
-LOG_DIR="/home/ubuntu/watchdog/logs"
-BACKEND_CONTAINER="ticketz-docker-acme-backend-1"
-BACKEND_URL="http://ticketz-docker-acme-backend-1:3000/"
+# ===== IDENTIFICAÇÃO DA VPS =====
+VPS_NAME="Minha VPS Producao"                       # ← Nome amigável
+BACKEND_PUBLIC_URL="https://app.meudominio.com.br"  # ← URL pública
 
-# ===== BACKUP DE LOGS =====
-SAVE_BACKEND_LOGS=true        # true = salva | false = não salva
-BACKUP_TYPE="FULL"            # FULL = completo | TAIL = últimas N linhas
-BACKUP_TAIL_LINES=50000       # Quantidade de linhas (se TAIL)
+# ===== CONFIGURAÇÕES PRINCIPAIS =====
+TICKETZ_DIR="/home/ubuntu/ticketz-docker-acme"  # ← Diretório onde está instalado o Ticketz
+BACKEND_CONTAINER="ticketz-docker-acme-backend-1"
+BACKEND_PORT=3000
 
 # ===== WEBHOOK (NOTIFICAÇÕES) =====
 WEBHOOK_URL="https://seu-n8n.com/webhook/watchdog"  # ← SUA URL
-WEBHOOK_AUTH_HEADER="Bearer seu_token_aqui"                 # ← SEU TOKEN
+WEBHOOK_AUTH_HEADER="Bearer seu_token_aqui"         # ← SEU TOKEN
 # Deixe vazio ("") para desabilitar notificações
 ```
+
+> **Dica:** O `TICKETZ_DIR` deve apontar para o diretório onde está o `docker-compose.yml` do seu Ticketz.
+> Os logs do watchdog são salvos automaticamente na pasta `~/watchdog/logs/`.
+
+### Atualizar o script sem perder configurações
+
+Para atualizar o script para a versão mais recente:
+```bash
+cd ~/watchdog
+git pull
+```
+Seu `.env-watchdog` permanece intacto (está no `.gitignore`).
 
 ### Passo 3: Testar
 
@@ -90,39 +109,30 @@ bash -n netsapp-watchdog.sh
 ./netsapp-watchdog.sh
 ```
 
-**Saída esperada:**
+**Saída esperada (sistema OK):**
 ```
-[2026-01-07 05:40:00] 🔒 Lock adquirido (PID: 123456, timeout: 1200s)
-[2026-01-07 05:40:00] 🔍 Iniciando verificação do Netsapp
-[2026-01-07 05:40:00] ✅ Backend OK (HTTP 200) - tentativa 1
-[2026-01-07 05:40:00] ✅ Sistema operacional - nenhuma ação necessária
-[2026-01-07 05:40:00] 🔓 Lock liberado
+[2026-02-23 05:00:00] 🔍 Verificação iniciada
+[2026-02-23 05:00:01] ✅ Sistema OK
 ```
 
-### Passo 4: Configurar cron
+### Passo 4: Configurar cron (a cada 15 minutos)
 
 ```bash
 crontab -e
 ```
 
-**Adicionar:**
-```bash
-# Watchdog Netsapp - Verificação a cada 1 minuto
-* * * * * /home/ubuntu/watchdog/netsapp-watchdog.sh
+Adicione a linha abaixo no final do arquivo:
+```
+*/15 * * * * /home/ubuntu/watchdog/netsapp-watchdog.sh >> /dev/null 2>&1
 ```
 
-**Salvar e fechar** (CTRL+O, ENTER, CTRL+X)
+> **Nota:** Ajuste o caminho se instalou em outro local (ex: `/root/watchdog/netsapp-watchdog.sh`).
 
 ### Passo 5: Verificar funcionamento
 
 ```bash
 # Ver logs em tempo real
-tail -f /home/ubuntu/watchdog/logs/watchdog.log
-
-# Simular crash para testar
-cd /home/ubuntu/ticketz-docker-acme
-sudo docker compose stop backend
-# Aguardar 1-2 minutos e verificar recuperação automática
+tail -f ~/watchdog/logs/watchdog.log
 ```
 
 ## ⚙️ Configurações Disponíveis
@@ -130,18 +140,26 @@ sudo docker compose stop backend
 ### Backup de Logs
 
 ```bash
+# Backup PARCIAL (mais rápido - recomendado, padrão)
+SAVE_BACKEND_LOGS=true
+BACKUP_TYPE="TAIL"
+BACKUP_TAIL_LINES=10000
+
 # Backup COMPLETO (todas as linhas - pode ser grande e demorado)
 SAVE_BACKEND_LOGS=true
 BACKUP_TYPE="FULL"
 
-# Backup PARCIAL (mais rápido - recomendado)
-SAVE_BACKEND_LOGS=true
-BACKUP_TYPE="TAIL"
-BACKUP_TAIL_LINES=50000  # Últimas 50 mil linhas (~5-10s)
-
 # SEM backup (mais rápido - não recomendado)
 SAVE_BACKEND_LOGS=false
 ```
+
+### Cooldown (proteção anti-loop)
+
+```bash
+COOLDOWN_SECONDS=900  # 15 minutos (padrão)
+```
+
+Após qualquer tentativa de recuperação (sucesso ou falha crítica), o script entra em cooldown e **não tenta novamente** durante esse período. Isso impede que o script entre em loop e trave a VPS.
 
 ### Notificações via Webhook
 
@@ -150,35 +168,30 @@ O script envia dados em JSON para qualquer webhook (n8n, Make, Zapier, etc):
 ```json
 {
   "event": "watchdog_alert",
-  "timestamp": "2026-01-07 05:36:43",
-  "hostname": "ticketz",
+  "timestamp": "2026-02-23 05:36:43",
+  "vps_name": "Minha VPS Producao",
+  "hostname": "vps-abc123",
+  "backend_url": "https://app.meudominio.com.br",
   "level": 1,
   "status": "success",
-  "message": "Sistema recuperado automaticamente via Nível 1 (Reinício Rápido)",
+  "message": "Sistema recuperado via Nível 1 (Reinício Rápido)",
   "details": {
-    "crash_log_filename": "backend-crash_20260107_053552.log",
-    "crash_log_path": "/home/ubuntu/watchdog/logs/backend-crash_20260107_053552.log",
-    "crash_log_size": "9.1M",
-    "crash_log_lines": "109280",
+    "crash_log_filename": "backend-crash_20260223_053552.log",
+    "crash_log_path": "/home/ubuntu/watchdog/logs/backend-crash_20260223_053552.log",
+    "crash_log_size": "2.1M",
+    "crash_log_lines": "5000",
     "recovery_duration": "51s"
   }
 }
 ```
 
-**No n8n, você pode:**
-- Enviar WhatsApp (via Evolution API, Baileys, Netsapp API)
-- Enviar Telegram
-- Enviar Email
-- Enviar SMS
-- Qualquer integração disponível
-
 ### Sistema de Lock
 
 ```bash
-LOCK_TIMEOUT=1200  # 20 minutos (tempo máximo de execução)
+LOCK_TIMEOUT=600  # 10 minutos (tempo máximo de execução)
 ```
 
-Previne múltiplas instâncias rodando simultaneamente. Se o script travar por mais de 20 minutos, o lock é removido automaticamente.
+Previne múltiplas instâncias rodando simultaneamente. Se o script travar por mais de 10 minutos, o lock é removido automaticamente.
 
 ### Proteção contra Updates
 
@@ -186,85 +199,89 @@ Previne múltiplas instâncias rodando simultaneamente. Se o script travar por m
 UPDATE_DETECTION_WAIT=30  # 30 segundos
 ```
 
-Quando o backend não é encontrado, aguarda 30s para confirmar se é:
-- **Update em andamento** → Não faz nada, aguarda próxima verificação
-- **Crash real** → Prossegue com recuperação
+O script detecta se há operações em andamento antes de agir:
+- `update.ticke.tz` rodando
+- `docker compose pull` em andamento
+- `docker compose up` em andamento
+
+Se detectar qualquer uma, sai imediatamente e aguarda próxima verificação.
 
 ## 📁 Estrutura de Arquivos
 
 ```
-/home/ubuntu/watchdog/
-├── netsapp-watchdog.sh          # Script principal
+~/watchdog/
+├── netsapp-watchdog.sh          # Script principal (pode ser atualizado sem perder config)
+├── .env-watchdog                # ⚙️ SUAS configurações (NÃO é sobrescrito na atualização)
+├── .env-watchdog-example        # Exemplo de configuração (referência)
 └── logs/
-    ├── watchdog.log              # Log principal do watchdog
-    ├── backend-crash_*.log       # Logs de crashes do backend
+    ├── watchdog.log              # Log principal (máx. 1MB, rotacionado)
+    ├── watchdog.log.old          # Log anterior (rotacionado)
+    ├── backend-crash_*.log       # Logs de crashes (últimos 10 mantidos)
     └── CRITICAL-FAILURE_*.log    # Relatórios de falhas críticas
 ```
 
-## 🧪 Testando Recuperação
-
-### Simular crash:
-
-```bash
-cd /home/ubuntu/ticketz-docker-acme
-sudo docker compose stop backend
-```
-
-### Acompanhar recuperação:
-
-```bash
-tail -f /home/ubuntu/watchdog/logs/watchdog.log
-```
-
-### Verificar webhook (se configurado):
-
-Acesse seu n8n/Make/Zapier e veja o webhook recebido com todos os dados.
-
 ## 📊 Níveis de Recuperação
 
-### Nível 1 - Reinício Rápido (~90% dos casos)
+### Nível 1 - Reinício Rápido (~85% dos casos)
 
-```bash
-1. Salva log do backend
-2. docker compose down backend frontend
-3. docker compose up -d backend frontend
-4. Aguarda 40s
-5. Verifica se voltou
+```
+1. docker compose stop backend frontend
+2. docker compose rm -f backend frontend
+3. Aguarda 5s
+4. docker compose up -d backend frontend
+5. Aguarda 45s → verifica
 ```
 
-**Tempo:** ~2 minutos  
-**Taxa de sucesso:** ~90%
+**Tempo:** ~1 minuto | **Impacto:** Mínimo (só backend + frontend)
 
-### Nível 2 - Update Completo (~9% dos casos)
+### Nível 2 - Reinício Completo (~10% dos casos)
 
-```bash
-1. Executa: curl -sSL update.ticke.tz | sudo bash
-2. Pull de imagens + down + up
-3. Aguarda 120s
-4. Verifica 5x (a cada 30s)
+```
+1. docker compose down (toda a stack)
+2. Aguarda 10s
+3. docker compose up -d (toda a stack)
+4. Aguarda 90s → verifica 3x (a cada 30s)
 ```
 
-**Tempo:** ~5-8 minutos  
-**Taxa de sucesso:** ~9%
+**Tempo:** ~2-4 minutos | **Impacto:** Médio (toda a stack)
 
-### Nível 3 - Falha Crítica (~1% dos casos)
+### Nível 3 - Update do Sistema (~4% dos casos)
 
-```bash
+```
+1. curl -sSL update.ticke.tz | bash
+2. Pull de imagens + down + up + prune
+3. Aguarda 90s → verifica 3x (a cada 30s)
+```
+
+**Tempo:** ~5-8 minutos | **Impacto:** Alto (download de imagens, só como último recurso)
+
+### Nível 4 - Falha Crítica (~1% dos casos)
+
+```
 1. Gera relatório de diagnóstico completo
 2. Envia webhook com status "critical"
-3. Aguarda intervenção manual
+3. Ativa cooldown
+4. Aguarda intervenção manual
 ```
 
 **Requer:** Intervenção humana
 
 ## 🔧 Troubleshooting
 
+### Erro "permission denied" no Docker
+
+O script auto-detecta se precisa de `sudo`. Se mesmo assim falhar:
+```bash
+# Adicionar usuário ao grupo docker (alternativa)
+sudo usermod -aG docker $USER
+# Fazer logout e login novamente
+```
+
 ### Webhook não recebe dados
 
 1. Verificar se workflow está **ATIVO** no n8n
-2. Verificar URL do webhook (deve ser `/webhook/...` em produção)
+2. Verificar URL do webhook (deve ser `/webhook/...` em produção, não `/webhook-test/...`)
 3. Testar manualmente:
-
 ```bash
 curl -X POST "https://seu-n8n.com/webhook/watchdog" \
   -H "Content-Type: application/json" \
@@ -274,36 +291,32 @@ curl -X POST "https://seu-n8n.com/webhook/watchdog" \
 
 ### Lock travado
 
-Se o script não executar e mostrar "Outra instância rodando", mas não há nenhuma:
+```bash
+rm /tmp/netsapp-watchdog.lock
+```
+
+### Cooldown ativo (quer forçar recuperação)
 
 ```bash
-# Remover lock manualmente
-rm /tmp/netsapp-watchdog.lock
-
-# Executar novamente
-/home/ubuntu/watchdog/netsapp-watchdog.sh
+rm /tmp/netsapp-watchdog-cooldown
 ```
 
 ### Cron não executa
 
 ```bash
-# Ver logs do cron
 grep CRON /var/log/syslog | tail -20
-
-# Verificar se cron está ativo
 sudo systemctl status cron
 ```
 
 ## 📈 Estatísticas de Uso
 
-Baseado em testes reais:
-
 | Métrica | Valor |
 |---|---|
-| Tempo de detecção | 1 minuto (cron) |
-| Tempo recuperação Nível 1 | 2 minutos |
-| Tempo recuperação Nível 2 | 5-8 minutos |
-| Taxa de sucesso total | 99% |
+| Intervalo de verificação | 15 minutos (cron) |
+| Tempo recuperação Nível 1 | ~1 minuto |
+| Tempo recuperação Nível 2 | ~2-4 minutos |
+| Tempo recuperação Nível 3 | ~5-8 minutos |
+| Taxa de sucesso total | ~99% |
 | Redução de downtime | 90-95% |
 
 ## 🤝 Contribuindo
@@ -331,4 +344,3 @@ Desenvolvido para a comunidade Ticketz com o objetivo de reduzir downtimes e aut
 ---
 
 ⭐ Se este script ajudou você, considere dar uma estrela no repositório!
-```
